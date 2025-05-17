@@ -1,0 +1,5 @@
+python-telegram-bot==20.4
+aiohttp==3.8.5
+python-dotenv==1.0.0
+cloudscraper==1.2.60
+
