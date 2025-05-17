@@ -2,19 +2,19 @@ import os
 import json
 import asyncio
 import logging
-from collections import defaultdict
+from typing import Optional
 
 import cloudscraper
 from telegram import Bot
 from telegram.error import RetryAfter, TimedOut, TelegramError
-from dotenv import load_dotenv
 from requests import HTTPError
+from dotenv import load_dotenv
 
-# Загрузка .env
+# Load configuration
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHANNEL_ID    = os.getenv("CHANNEL_ID")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 30))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 2))
 USER_AUTH     = os.getenv("USER_AUTH")
 
 if not BOT_TOKEN or not CHANNEL_ID:
@@ -37,9 +37,6 @@ HEADERS = {
     )
 }
 
-# Пропускаемые коллекции
-SKIP_COLLECTIONS = {"DeskCalendar", "LolPop"}
-
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.DEBUG
@@ -51,7 +48,7 @@ def normalize_name(name: str) -> str:
     return ''.join(ch for ch in name if ch.isalnum())
 
 
-def fetch_listings(scraper):
+def fetch_listings(scraper) -> list[dict]:
     payload = {
         "page":        1,
         "limit":       30,
@@ -64,29 +61,55 @@ def fetch_listings(scraper):
         }),
         "price_range": None,
         "ref":         0,
-        "user_auth":   USER_AUTH
+        "user_auth":   USER_AUTH,
     }
     try:
         resp = scraper.post(API_URL, json=payload, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else data.get('data') or data.get('docs') or []
+        if isinstance(data, list):
+            return data
+        return data.get("data") or data.get("docs") or []
     except HTTPError as e:
         logger.error("HTTP error fetching listings: %s", e)
     except Exception:
-        logger.exception("Unexpected error fetching listings:")
+        logger.exception("Unexpected error fetching listings")
     return []
 
 
-def fmt(cur, flr):
-    if flr is None or flr == 0:
-        return "— TON", "😐+0.0%"
-    pct = (cur - flr) / flr * 100
-    if abs(pct) < 1e-6:
-        arrow = "😐"
-    else:
-        arrow = "🔻" if pct < 0 else "🔺"
-    return f"{flr} TON", f"{arrow}{abs(pct):.1f}%"
+def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Optional[float]:
+    flt = {
+        "price":     {"$exists": True},
+        "refunded":  {"$ne":    True},
+        "buyer":     {"$exists": False},
+        "export_at": {"$exists": True},
+        "gift_name": name,
+        "asset":     "TON",
+    }
+    if model:
+        flt["model"] = model
+
+    payload = {
+        "page":        1,
+        "limit":       1,
+        "sort":        json.dumps({"price": 1}),
+        "filter":      json.dumps(flt),
+        "price_range": None,
+        "ref":         0,
+        "user_auth":   USER_AUTH,
+    }
+    try:
+        resp = scraper.post(API_URL, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+        docs = data if isinstance(data, list) else data.get("data") or data.get("docs") or []
+        if docs:
+            return docs[0]["price"]
+    except HTTPError as e:
+        logger.error("HTTP error fetching floor price: %s", e)
+    except Exception:
+        logger.exception("Unexpected error fetching floor price")
+    return None
 
 
 async def send_alert(bot: Bot, chat_id: str, text: str):
@@ -100,11 +123,19 @@ async def send_alert(bot: Bot, chat_id: str, text: str):
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except TelegramError as e:
         logger.error("Telegram error: %s", e)
-    await asyncio.sleep(3)  # не чаще 1 сообщения в 3 секунды
+    await asyncio.sleep(3)  # throttle: не чаще 1 сообщения в 3 секунды
+
+
+def fmt_floor(price: float, floor: Optional[float]) -> tuple[str, float]:
+    if floor is None or floor == 0:
+        return "— TON (+0.0%)", 0.0
+    pct = (price - floor) / floor * 100
+    arrow = "➖" if abs(pct) < 0.05 else ("🔻" if pct < 0 else "🔺")
+    return f"{floor} TON ({arrow}{pct:+.1f}%)", pct
 
 
 async def monitor():
-    logger.info("🚀 Старт мониторинга… интервал %s сек.", POLL_INTERVAL)
+    logger.info("🚀 Старт мониторинга …")
     bot = Bot(token=BOT_TOKEN)
     scraper = cloudscraper.create_scraper()
     scraper.get(API_BASE)
@@ -119,52 +150,52 @@ async def monitor():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        by_coll = defaultdict(list)
-        for g in docs:
-            by_coll[normalize_name(g["name"])].append(g)
-
-        to_proc = docs[:1] if first_run else docs
+        to_proc = [docs[0]] if first_run else docs
         first_run = False
 
         for g in to_proc:
-            gift_num = g["gift_num"]
-            if gift_num in seen:
+            num = g.get("gift_num")
+            if num in seen:
+                continue
+            seen.add(num)
+
+            name     = g.get("name", "")
+            key      = normalize_name(name)
+            if key in ("DeskCalendar", "LolPop"):
                 continue
 
-            key = normalize_name(g["name"])
-            if key in SKIP_COLLECTIONS:
-                continue
-            seen.add(gift_num)
+            price    = g.get("price", 0)
+            model    = g.get("model", "")
+            symbol   = g.get("symbol", "")
+            backdrop = g.get("backdrop", "")
+            link     = f"https://t.me/nft/{key}-{num}"
 
-            price    = g["price"]
-            model    = g["model"]
-            symbol   = g["symbol"]
-            backdrop = g["backdrop"]
+            # fetch floors
+            floor_all   = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
+            floor_mod   = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
 
-            coll        = by_coll[key]
-            floor_all   = min((x["price"] for x in coll), default=None)
-            same_model  = [x for x in coll if x["model"] == model]
-            floor_model = min((x["price"] for x in same_model), default=None)
+            # check 10% drop condition
+            cond1 = floor_all is not None and price <= floor_all * 0.99
+            cond2 = floor_mod is not None and price <= floor_mod * 0.99
+            if not (cond1 or cond2):
+                continue  # пропускаем, если не удовлетворяет
 
-            floor_all_str, pct_all   = fmt(price, floor_all)
-            floor_mod_str, pct_model = fmt(price, floor_model)
-
-            name = g["name"]
-            link = f"https://t.me/nft/{key}-{gift_num}"
+            fa_str, _ = fmt_floor(price, floor_all)
+            fm_str, _ = fmt_floor(price, floor_mod)
 
             msg = (
-                f"*🎁 {name}* `#{gift_num}`\n"
+                f"*🎁 {name}* `#{num}`\n"
                 f"*Price:* `{price} TON`\n\n"
-                f"*Floor (all):* `{floor_all_str}` (`{pct_all}`)\n"
-                f"*(model «{model}»):* `{floor_mod_str}` (`{pct_model}`)\n\n"
+                f"*Floor (all):* `{fa_str}`\n"
+                f"*Floor (model «{model}»):* `{fm_str}`\n\n"
                 f"*Model:* `{model}`\n"
                 f"*Symbol:* `{symbol}`\n"
                 f"*Backdrop:* `{backdrop}`\n\n"
-
-                f"({link}.gif)"
+                f"`#`{backdrop.split()[0]} `#`{symbol.split()[0]} `#5ton`\n"
+                f"🎬 [GIF]({link}.gif)"
             )
 
-            logger.debug("Отправляем оповещение gift_num=%s", gift_num)
+            logger.debug("Alert for #%s: price %s vs floor_all=%s floor_mod=%s", num, price, floor_all, floor_mod)
             await send_alert(bot, CHANNEL_ID, msg)
 
         await asyncio.sleep(POLL_INTERVAL)
