@@ -68,7 +68,7 @@ def fetch_listings(scraper) -> List[Dict]:
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("data") or data.get("docs") or []
-    except Exception as e:
+    except Exception:
         logger.exception("Error fetching listings")
     return []
 
@@ -124,7 +124,6 @@ async def send_gift_alert(
         InlineKeyboardButton(text="Перейти на маркет", url=market_link)
     )
     try:
-        # отправляем как Animation, чтобы сразу была превью GIF
         await bot.send_animation(
             chat_id=chat_id,
             animation=gif_url,
@@ -144,12 +143,11 @@ async def send_gift_alert(
                                  reply_markup=keyboard)
     except TelegramError as e:
         logger.error("Telegram error: %s", e)
-    # throttle: не чаще 1 сообщения в 3 секунды
-    await asyncio.sleep(3)
+    await asyncio.sleep(3)  # throttle
 
 
 async def monitor():
-    logger.info("🚀 Старт мониторинга Platinum фоновых подарков…")
+    logger.info("🚀 Старт мониторинга всех фоновых подарков…")
     bot = Bot(token=BOT_TOKEN)
     scraper = cloudscraper.create_scraper()
     scraper.get(API_BASE)
@@ -173,14 +171,10 @@ async def monitor():
                 continue
             seen.add(gift_num)
 
-            backdrop = g.get("backdrop", "")
-            if not backdrop.startswith("Platinum"):
-                continue
-
-            # собираем данные
             name     = g.get("name", "")
             model    = g.get("model", "")
             symbol   = g.get("symbol", "")
+            backdrop = g.get("backdrop", "")
             price    = g.get("price", 0)
             gift_id  = g.get("gift_id")
 
