@@ -150,35 +150,31 @@ async def monitor():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
+        # только самое последнее на первом прогоне, затем все
         to_proc = [docs[0]] if first_run else docs
         first_run = False
 
         for g in to_proc:
-            num = g.get("gift_num")
+            num      = g.get("gift_num")
             if num in seen:
                 continue
             seen.add(num)
 
             name     = g.get("name", "")
-            key      = normalize_name(name)
-            if key in ("DeskCalendar", "LolPop"):
-                continue
-
             price    = g.get("price", 0)
             model    = g.get("model", "")
             symbol   = g.get("symbol", "")
             backdrop = g.get("backdrop", "")
+            key      = normalize_name(name)
             link     = f"https://t.me/nft/{key}-{num}"
 
-            # fetch floors
-            floor_all   = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
-            floor_mod   = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
+            # фильтр по backdrop = Platinum
+            if not backdrop.startswith("Platinum"):
+                continue
 
-            # check 10% drop condition
-            cond1 = floor_all is not None and price <= floor_all * 0.99
-            cond2 = floor_mod is not None and price <= floor_mod * 0.99
-            if not (cond1 or cond2):
-                continue  # пропускаем, если не удовлетворяет
+            # считаем флоры
+            floor_all = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
+            floor_mod = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
 
             fa_str, _ = fmt_floor(price, floor_all)
             fm_str, _ = fmt_floor(price, floor_mod)
@@ -195,7 +191,7 @@ async def monitor():
                 f"🎬 [GIF]({link}.gif)"
             )
 
-            logger.debug("Alert for #%s: price %s vs floor_all=%s floor_mod=%s", num, price, floor_all, floor_mod)
+            logger.debug("🔔 Publishing Platinum gift #%s", num)
             await send_alert(bot, CHANNEL_ID, msg)
 
         await asyncio.sleep(POLL_INTERVAL)
