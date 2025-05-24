@@ -5,7 +5,7 @@ import logging
 from typing import Optional, List, Dict
 
 import cloudscraper
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter, TimedOut, TelegramError
 from requests import HTTPError
 from dotenv import load_dotenv
@@ -45,12 +45,10 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_name(name: str) -> str:
-    """Убираем всё, кроме букв и цифр, для формирования url-base."""
     return ''.join(ch for ch in name if ch.isalnum())
 
 
 def fetch_listings(scraper) -> List[Dict]:
-    """Получаем последние 30 листингов."""
     payload = {
         "page":        1,
         "limit":       30,
@@ -70,15 +68,12 @@ def fetch_listings(scraper) -> List[Dict]:
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("data") or data.get("docs") or []
-    except HTTPError as e:
-        logger.error("HTTP error fetching listings: %s", e)
-    except Exception:
-        logger.exception("Unexpected error fetching listings")
+    except Exception as e:
+        logger.exception("Error fetching listings")
     return []
 
 
 def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Optional[float]:
-    """Берём минимальную цену (floor) для коллекции или конкретной модели."""
     flt = {
         "price":     {"$exists": True},
         "refunded":  {"$ne":    True},
@@ -105,31 +100,12 @@ def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Option
         data = resp.json()
         docs = data if isinstance(data, list) else data.get("data") or data.get("docs") or []
         return docs[0]["price"] if docs else None
-    except HTTPError as e:
-        logger.error("HTTP error fetching floor price: %s", e)
     except Exception:
-        logger.exception("Unexpected error fetching floor price")
+        logger.exception("Error fetching floor price")
     return None
 
 
-async def send_alert(bot: Bot, chat_id: str, text: str):
-    """Шлём сообщение, обрабатывая rate-limit."""
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-    except TimedOut:
-        await asyncio.sleep(5)
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-    except TelegramError as e:
-        logger.error("Telegram error: %s", e)
-    # throttle: не чаще 1 сообщения в 3 секунды
-    await asyncio.sleep(3)
-
-
 def fmt_floor(price: float, floor: Optional[float]) -> str:
-    """Готовим строку вида 'X TON (🔻+Y%)' или '— TON'."""
     if floor is None or floor == 0:
         return "— TON (+0.0%)"
     pct = (price - floor) / floor * 100
@@ -137,11 +113,46 @@ def fmt_floor(price: float, floor: Optional[float]) -> str:
     return f"{floor} TON ({arrow}{pct:+.1f}%)"
 
 
+async def send_gift_alert(
+    bot: Bot,
+    chat_id: str,
+    market_link: str,
+    gif_url: str,
+    caption: str
+):
+    keyboard = InlineKeyboardMarkup.from_button(
+        InlineKeyboardButton(text="Перейти на маркет", url=market_link)
+    )
+    try:
+        # отправляем как Animation, чтобы сразу была превью GIF
+        await bot.send_animation(
+            chat_id=chat_id,
+            animation=gif_url,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await bot.send_animation(chat_id=chat_id, animation=gif_url,
+                                 caption=caption, parse_mode="Markdown",
+                                 reply_markup=keyboard)
+    except TimedOut:
+        await asyncio.sleep(5)
+        await bot.send_animation(chat_id=chat_id, animation=gif_url,
+                                 caption=caption, parse_mode="Markdown",
+                                 reply_markup=keyboard)
+    except TelegramError as e:
+        logger.error("Telegram error: %s", e)
+    # throttle: не чаще 1 сообщения в 3 секунды
+    await asyncio.sleep(3)
+
+
 async def monitor():
     logger.info("🚀 Старт мониторинга Platinum фоновых подарков…")
     bot = Bot(token=BOT_TOKEN)
     scraper = cloudscraper.create_scraper()
-    scraper.get(API_BASE)  # установить куки
+    scraper.get(API_BASE)
 
     seen = set()
     first_run = True
@@ -153,7 +164,6 @@ async def monitor():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        # при первом запуске обрабатываем только самый последний
         to_proc = [docs[0]] if first_run else docs
         first_run = False
 
@@ -163,42 +173,41 @@ async def monitor():
                 continue
             seen.add(gift_num)
 
-            name     = g.get("name", "")
-            model    = g.get("model", "")
-            symbol   = g.get("symbol", "")
             backdrop = g.get("backdrop", "")
-            price    = g.get("price", 0)
-
-            # фильтр: только фон Platinum
             if not backdrop.startswith("Platinum"):
                 continue
 
-            # готовим ссылки
-            gift_id     = g["gift_id"]
-            market_link = f"https://t.me/tonnel_network_bot/gift?startapp={gift_id}"
-            gif_link    = f"https://t.me/nft/{normalize_name(name)}-{gift_id}.gif"
+            # собираем данные
+            name     = g.get("name", "")
+            model    = g.get("model", "")
+            symbol   = g.get("symbol", "")
+            price    = g.get("price", 0)
+            gift_id  = g.get("gift_id")
 
-            # берём floor-цены
+            # ссылки
+            market_link = f"https://t.me/tonnel_network_bot/gift?startapp={gift_id}"
+            gif_url      = f"https://t.me/nft/{normalize_name(name)}-{gift_id}.gif"
+
+            # флооры
             floor_all   = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
             floor_model = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
 
             fa_str = fmt_floor(price, floor_all)
             fm_str = fmt_floor(price, floor_model)
 
-            msg = (
-                f"*🎁 [{name}]({market_link})* `#{gift_id}`\n"
+            caption = (
+                f"*🎁 {name}* `#{gift_id}`\n"
                 f"*Price:* `{price} TON`\n\n"
                 f"*Floor (all):* `{fa_str}`\n"
                 f"*Floor (model «{model}»):* `{fm_str}`\n\n"
                 f"*Model:* `{model}`\n"
                 f"*Symbol:* `{symbol}`\n"
                 f"*Backdrop:* `{backdrop}`\n\n"
-                f"`#`{backdrop.split()[0]} `#`{symbol.split()[0]} `#5ton`\n"
-                f"🎬 [GIF]({gif_link})"
+                f"`#`{backdrop.split()[0]} `#`{symbol.split()[0]} `#5ton`"
             )
 
             logger.debug("🔔 Оповещение для %s (%s)", name, gift_id)
-            await send_alert(bot, CHANNEL_ID, msg)
+            await send_gift_alert(bot, CHANNEL_ID, market_link, gif_url, caption)
 
         await asyncio.sleep(POLL_INTERVAL)
 
