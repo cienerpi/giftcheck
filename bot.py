@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, List, Dict
 
 import cloudscraper
 from telegram import Bot
@@ -10,7 +10,7 @@ from telegram.error import RetryAfter, TimedOut, TelegramError
 from requests import HTTPError
 from dotenv import load_dotenv
 
-# Load configuration
+# Загрузка конфигурации
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHANNEL_ID    = os.getenv("CHANNEL_ID")
@@ -45,10 +45,12 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_name(name: str) -> str:
+    """Убираем всё, кроме букв и цифр, для формирования url-base."""
     return ''.join(ch for ch in name if ch.isalnum())
 
 
-def fetch_listings(scraper) -> list[dict]:
+def fetch_listings(scraper) -> List[Dict]:
+    """Получаем последние 30 листингов."""
     payload = {
         "page":        1,
         "limit":       30,
@@ -67,9 +69,7 @@ def fetch_listings(scraper) -> list[dict]:
         resp = scraper.post(API_URL, json=payload, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list):
-            return data
-        return data.get("data") or data.get("docs") or []
+        return data if isinstance(data, list) else data.get("data") or data.get("docs") or []
     except HTTPError as e:
         logger.error("HTTP error fetching listings: %s", e)
     except Exception:
@@ -78,6 +78,7 @@ def fetch_listings(scraper) -> list[dict]:
 
 
 def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Optional[float]:
+    """Берём минимальную цену (floor) для коллекции или конкретной модели."""
     flt = {
         "price":     {"$exists": True},
         "refunded":  {"$ne":    True},
@@ -103,8 +104,7 @@ def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Option
         resp.raise_for_status()
         data = resp.json()
         docs = data if isinstance(data, list) else data.get("data") or data.get("docs") or []
-        if docs:
-            return docs[0]["price"]
+        return docs[0]["price"] if docs else None
     except HTTPError as e:
         logger.error("HTTP error fetching floor price: %s", e)
     except Exception:
@@ -113,6 +113,7 @@ def fetch_floor_price(scraper, name: str, model: Optional[str] = None) -> Option
 
 
 async def send_alert(bot: Bot, chat_id: str, text: str):
+    """Шлём сообщение, обрабатывая rate-limit."""
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except RetryAfter as e:
@@ -123,22 +124,24 @@ async def send_alert(bot: Bot, chat_id: str, text: str):
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except TelegramError as e:
         logger.error("Telegram error: %s", e)
-    await asyncio.sleep(3)  # throttle: не чаще 1 сообщения в 3 секунды
+    # throttle: не чаще 1 сообщения в 3 секунды
+    await asyncio.sleep(3)
 
 
-def fmt_floor(price: float, floor: Optional[float]) -> tuple[str, float]:
+def fmt_floor(price: float, floor: Optional[float]) -> str:
+    """Готовим строку вида 'X TON (🔻+Y%)' или '— TON'."""
     if floor is None or floor == 0:
-        return "— TON (+0.0%)", 0.0
+        return "— TON (+0.0%)"
     pct = (price - floor) / floor * 100
     arrow = "➖" if abs(pct) < 0.05 else ("🔻" if pct < 0 else "🔺")
-    return f"{floor} TON ({arrow}{pct:+.1f}%)", pct
+    return f"{floor} TON ({arrow}{pct:+.1f}%)"
 
 
 async def monitor():
-    logger.info("🚀 Старт мониторинга …")
+    logger.info("🚀 Старт мониторинга Platinum фоновых подарков…")
     bot = Bot(token=BOT_TOKEN)
     scraper = cloudscraper.create_scraper()
-    scraper.get(API_BASE)
+    scraper.get(API_BASE)  # установить куки
 
     seen = set()
     first_run = True
@@ -150,37 +153,40 @@ async def monitor():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        # только самое последнее на первом прогоне, затем все
+        # при первом запуске обрабатываем только самый последний
         to_proc = [docs[0]] if first_run else docs
         first_run = False
 
         for g in to_proc:
-            num      = g.get("gift_num")
-            if num in seen:
+            gift_num = g.get("gift_num")
+            if gift_num in seen:
                 continue
-            seen.add(num)
+            seen.add(gift_num)
 
             name     = g.get("name", "")
-            price    = g.get("price", 0)
             model    = g.get("model", "")
             symbol   = g.get("symbol", "")
             backdrop = g.get("backdrop", "")
-            key      = normalize_name(name)
-            link     = f"https://t.me/nft/{key}-{num}"
+            price    = g.get("price", 0)
 
-            # фильтр по backdrop = Platinum
+            # фильтр: только фон Platinum
             if not backdrop.startswith("Platinum"):
                 continue
 
-            # считаем флоры
-            floor_all = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
-            floor_mod = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
+            # готовим ссылки
+            gift_id     = g["gift_id"]
+            market_link = f"https://t.me/tonnel_network_bot/gift?startapp={gift_id}"
+            gif_link    = f"https://t.me/nft/{normalize_name(name)}-{gift_id}.gif"
 
-            fa_str, _ = fmt_floor(price, floor_all)
-            fm_str, _ = fmt_floor(price, floor_mod)
+            # берём floor-цены
+            floor_all   = await loop.run_in_executor(None, fetch_floor_price, scraper, name)
+            floor_model = await loop.run_in_executor(None, fetch_floor_price, scraper, name, model)
+
+            fa_str = fmt_floor(price, floor_all)
+            fm_str = fmt_floor(price, floor_model)
 
             msg = (
-                f"*🎁 {name}* `#{num}`\n"
+                f"*🎁 [{name}]({market_link})* `#{gift_id}`\n"
                 f"*Price:* `{price} TON`\n\n"
                 f"*Floor (all):* `{fa_str}`\n"
                 f"*Floor (model «{model}»):* `{fm_str}`\n\n"
@@ -188,10 +194,10 @@ async def monitor():
                 f"*Symbol:* `{symbol}`\n"
                 f"*Backdrop:* `{backdrop}`\n\n"
                 f"`#`{backdrop.split()[0]} `#`{symbol.split()[0]} `#5ton`\n"
-                f"🎬 [GIF]({link}.gif)"
+                f"🎬 [GIF]({gif_link})"
             )
 
-            logger.debug("🔔 Publishing Platinum gift #%s", num)
+            logger.debug("🔔 Оповещение для %s (%s)", name, gift_id)
             await send_alert(bot, CHANNEL_ID, msg)
 
         await asyncio.sleep(POLL_INTERVAL)
