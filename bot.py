@@ -447,7 +447,7 @@ async def monitor():
                 f"*Backdrop:* `{backdrop}`\n\n"
                 f"🎬 [GIF]({gif_url})"
             )
-            # инлайн-кнопка «Buy on Market»
+            # инлайн-кнопка «Buy on Market»sdsd
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buy on Market", url=market_link)]])
 
             logger.debug("🔔 Publishing discount gift #%s", gift_num)
