@@ -171,7 +171,7 @@ async def monitor():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        # на первом проходе — только самый последний, потом — все
+        # на первом проходе — только самый последний, потом — все55
         to_proc = [docs[0]] if first_run else docs
         first_run = False
 
